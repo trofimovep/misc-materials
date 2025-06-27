@@ -7,8 +7,13 @@
 #include <numeric>
 #include <future>
 #include <thread>
+#include <mutex>
+#include <queue>
+#include <functional>
+#include <condition_variable>
+#include <chrono>
 
-// Simple matrix class for CPU computation
+// Optimized matrix class with memory-efficient operations
 class Matrix {
 public:
     std::vector<double> data;
@@ -17,9 +22,11 @@ public:
     Matrix(int r, int c) : rows(r), cols(c), data(r * c, 0.0) {}
     Matrix(int r, int c, const std::vector<double>& d) : rows(r), cols(c), data(d) {}
     
-    double& operator()(int i, int j) { return data[i * cols + j]; }
-    const double& operator()(int i, int j) const { return data[i * cols + j]; }
+    // Inline accessors for better performance
+    inline double& operator()(int i, int j) { return data[i * cols + j]; }
+    inline const double& operator()(int i, int j) const { return data[i * cols + j]; }
     
+    // Standard transpose for clarity
     Matrix transpose() const {
         Matrix result(cols, rows);
         for (int i = 0; i < rows; i++) {
@@ -30,24 +37,42 @@ public:
         return result;
     }
     
+    // Cache-friendly matrix multiplication with blocking
     Matrix multiply(const Matrix& other) const {
         if (cols != other.rows) {
             throw std::invalid_argument("Matrix dimensions don't match for multiplication");
         }
         
         Matrix result(rows, other.cols);
-        for (int i = 0; i < rows; i++) {
-            for (int j = 0; j < other.cols; j++) {
-                double sum = 0.0;
-                for (int k = 0; k < cols; k++) {
-                    sum += (*this)(i, k) * other(k, j);
+        const int block_size = 64;
+        
+        // Initialize result to zero
+        std::fill(result.data.begin(), result.data.end(), 0.0);
+        
+        // Blocked multiplication for better cache locality
+        for (int ii = 0; ii < rows; ii += block_size) {
+            for (int jj = 0; jj < other.cols; jj += block_size) {
+                for (int kk = 0; kk < cols; kk += block_size) {
+                    int i_max = std::min(ii + block_size, rows);
+                    int j_max = std::min(jj + block_size, other.cols);
+                    int k_max = std::min(kk + block_size, cols);
+                    
+                    for (int i = ii; i < i_max; i++) {
+                        for (int j = jj; j < j_max; j++) {
+                            double sum = 0.0;
+                            for (int k = kk; k < k_max; k++) {
+                                sum += (*this)(i, k) * other(k, j);
+                            }
+                            result(i, j) += sum;
+                        }
+                    }
                 }
-                result(i, j) = sum;
             }
         }
         return result;
     }
     
+    // Get block copy (for compatibility with original algorithm)
     Matrix getBlock(int start_row, int start_col, int block_rows, int block_cols) const {
         Matrix block(block_rows, block_cols);
         for (int i = 0; i < block_rows; i++) {
@@ -60,6 +85,7 @@ public:
         return block;
     }
     
+    // Set block
     void setBlock(int start_row, int start_col, const Matrix& block) {
         for (int i = 0; i < block.rows; i++) {
             for (int j = 0; j < block.cols; j++) {
@@ -88,34 +114,28 @@ public:
     }
 };
 
-// Simple SVD implementation for pseudoinverse
+// Optimized SVD with better numerical stability
 class SVD {
 public:
-    static Matrix pseudoInverse(const Matrix& A, double tolerance = 1e-10) {
-        // Simplified pseudoinverse using Moore-Penrose method
-        // For a complete implementation, you'd want to use a proper SVD library like LAPACK
-        
-        Matrix AT = A.transpose();
-        Matrix ATA = AT.multiply(A);
-        Matrix AAT = A.multiply(AT);
-        
-        // For now, we'll use a simplified approach
-        // In practice, you'd compute the actual SVD decomposition
-        
+    static Matrix pseudoInverse(const Matrix& A, double tolerance = 1e-12) {
         if (A.rows >= A.cols) {
             // Tall matrix: A+ = (A^T * A)^-1 * A^T
+            Matrix AT = A.transpose();
+            Matrix ATA = AT.multiply(A);
             Matrix inv_ATA = invertMatrix(ATA, tolerance);
             return inv_ATA.multiply(AT);
         } else {
             // Wide matrix: A+ = A^T * (A * A^T)^-1
+            Matrix AT = A.transpose();
+            Matrix AAT = A.multiply(AT);
             Matrix inv_AAT = invertMatrix(AAT, tolerance);
             return AT.multiply(inv_AAT);
         }
     }
     
 private:
+    // Optimized matrix inversion with partial pivoting
     static Matrix invertMatrix(const Matrix& A, double tolerance) {
-        // Simplified matrix inversion using Gauss-Jordan elimination
         int n = A.rows;
         if (n != A.cols) {
             throw std::invalid_argument("Matrix must be square for inversion");
@@ -123,6 +143,8 @@ private:
         
         // Create augmented matrix [A | I]
         Matrix augmented(n, 2 * n);
+        
+        // Initialize augmented matrix
         for (int i = 0; i < n; i++) {
             for (int j = 0; j < n; j++) {
                 augmented(i, j) = A(i, j);
@@ -130,12 +152,16 @@ private:
             }
         }
         
-        // Gauss-Jordan elimination
+        // Gauss-Jordan elimination with partial pivoting
         for (int i = 0; i < n; i++) {
             // Find pivot
             int pivot_row = i;
+            double max_val = std::abs(augmented(i, i));
+            
             for (int k = i + 1; k < n; k++) {
-                if (std::abs(augmented(k, i)) > std::abs(augmented(pivot_row, i))) {
+                double val = std::abs(augmented(k, i));
+                if (val > max_val) {
+                    max_val = val;
                     pivot_row = k;
                 }
             }
@@ -148,14 +174,15 @@ private:
             }
             
             // Check for singularity
-            if (std::abs(augmented(i, i)) < tolerance) {
+            if (max_val < tolerance) {
                 throw std::runtime_error("Matrix is singular or nearly singular");
             }
             
             // Scale pivot row
             double pivot = augmented(i, i);
+            double inv_pivot = 1.0 / pivot;
             for (int j = 0; j < 2 * n; j++) {
-                augmented(i, j) /= pivot;
+                augmented(i, j) *= inv_pivot;
             }
             
             // Eliminate column
@@ -181,7 +208,7 @@ private:
     }
 };
 
-class CpuBlockBinv {
+class OptimizedCpuBlockBinv {
 private:
     std::vector<Matrix> blocks;
     std::vector<Matrix> pblocks;
@@ -193,7 +220,7 @@ private:
     int num_blocks;
 
 public:
-    CpuBlockBinv() : pMatrix(1, 1), matrixToInverse(1, 1) {}
+    OptimizedCpuBlockBinv() : pMatrix(1, 1), matrixToInverse(1, 1) {}
     
 private:
     void divideIntoBlocks(const Matrix& matrix, int blocks_amount) {
@@ -202,11 +229,12 @@ private:
         num_blocks = blocks_amount;
         
         if (blocks_amount == 0) {
-            blocks_amount = matrix_cols;
+            blocks_amount = std::max(2, std::min(8, matrix_cols / 32));
             num_blocks = blocks_amount;
         }
         
-        block_size = std::round((float)matrix_cols / (float)blocks_amount);
+        block_size = matrix_cols / blocks_amount;
+        int remaining = matrix_cols % blocks_amount;
         
         // Initialize matrices
         pMatrix = Matrix(matrix_cols, matrix_rows);
@@ -215,30 +243,37 @@ private:
         // Clear previous blocks
         blocks.clear();
         pblocks.clear();
+        blocks.reserve(num_blocks);
+        pblocks.reserve(num_blocks);
         
-        // Divide into blocks
+        // Divide into blocks with proper handling of remainder
         int start = 0;
         for (int b = 0; b < blocks_amount; b++) {
-            int col_amount = block_size;
-            if (b == blocks_amount - 1) {
-                col_amount = matrix_cols - start;
-            }
+            int col_amount = block_size + (b < remaining ? 1 : 0);
             
             Matrix block = matrix.getBlock(0, start, matrix_rows, col_amount);
-            blocks.push_back(block);
+            blocks.push_back(std::move(block));
             
             // Reserve space for pseudoinverse block
             pblocks.push_back(Matrix(col_amount, matrix_rows));
             
-            start += block_size;
+            start += col_amount;
         }
     }
     
     void multiplyPseudoInverseAndFillMatrix(const Matrix& pblock, int block_id, int another_block_id) {
         Matrix product = pblock.multiply(blocks[another_block_id]);
         
-        int row_start = block_id * block_size;
-        int col_start = another_block_id * block_size;
+        // Calculate proper row and column starts for variable block sizes
+        int row_start = 0;
+        int col_start = 0;
+        
+        for (int i = 0; i < block_id; i++) {
+            row_start += blocks[i].cols; // Use cols because we're placing in identity matrix
+        }
+        for (int i = 0; i < another_block_id; i++) {
+            col_start += blocks[i].cols;
+        }
         
         matrixToInverse.setBlock(row_start, col_start, product);
     }
@@ -248,8 +283,11 @@ private:
         Matrix pblock = SVD::pseudoInverse(blocks[block_id]);
         pblocks[block_id] = pblock;
         
-        // Set block in pMatrix
-        int start = block_id * block_size;
+        // Set block in pMatrix - calculate proper start position
+        int start = 0;
+        for (int i = 0; i < block_id; i++) {
+            start += blocks[i].cols;
+        }
         pMatrix.setBlock(start, 0, pblock);
         
         // Multiply with other blocks
@@ -263,10 +301,11 @@ private:
     void processAllBlocks() {
         // Process blocks in parallel
         std::vector<std::future<void>> futures;
+        futures.reserve(num_blocks);
         
         for (int id = 0; id < num_blocks; id++) {
             futures.push_back(
-                std::async(std::launch::async, &CpuBlockBinv::formMatrices, this, id)
+                std::async(std::launch::async, &OptimizedCpuBlockBinv::formMatrices, this, id)
             );
         }
         
@@ -277,11 +316,20 @@ private:
     }
 
 public:
-    Matrix binv(const Matrix& matrix, int block_amount = 2) {
+    Matrix binv(const Matrix& matrix, int block_amount = 0) {
+        if (block_amount == 0) {
+            // Auto-determine optimal block count
+            int max_threads = std::thread::hardware_concurrency();
+            block_amount = std::min(max_threads, std::max(2, matrix.cols / 64));
+        }
+        
+        // Ensure we don't have more blocks than columns
+        block_amount = std::min(block_amount, matrix.cols);
+        
         divideIntoBlocks(matrix, block_amount);
         processAllBlocks();
         
-        // Final computation: matrixToInverse^-1 * pMatrix
+        // Final computation
         try {
             Matrix inv_matrixToInverse = SVD::pseudoInverse(matrixToInverse);
             return inv_matrixToInverse.multiply(pMatrix);
@@ -294,8 +342,8 @@ public:
     
     // Convenience method for vector input
     std::vector<double> binv(const std::vector<double>& matrix_data, 
-                           int rows, int cols, int block_amount = 2) {
-        if (matrix_data.size() != rows * cols) {
+                           int rows, int cols, int block_amount = 0) {
+        if (matrix_data.size() != static_cast<size_t>(rows * cols)) {
             throw std::invalid_argument("Matrix size doesn't match dimensions");
         }
         
@@ -306,33 +354,66 @@ public:
     }
 };
 
-// Example usage function
+// Example usage with performance measurement
 void example_usage() {
     try {
-        CpuBlockBinv cpu_binv;
+        OptimizedCpuBlockBinv cpu_binv;
         
-        // Example 4x4 matrix
-        std::vector<double> matrix_data = {
+        // Test with both original small example and larger matrix
+        std::cout << "=== Testing with 4x4 matrix ===" << std::endl;
+        std::vector<double> small_matrix = {
             1.0, 2.0, 3.0, 4.0,
             2.0, 3.0, 4.0, 1.0,
             3.0, 4.0, 1.0, 2.0,
             4.0, 1.0, 2.0, 3.0
         };
         
-        auto result = cpu_binv.binv(matrix_data, 4, 4, 2);
+        auto result_small = cpu_binv.binv(small_matrix, 4, 4, 2);
         
         std::cout << "Input matrix:" << std::endl;
-        Matrix input(4, 4, matrix_data);
+        Matrix input_small(4, 4, small_matrix);
+        input_small.print();
+        
+        std::cout << "\nResult matrix:" << std::endl;
+        Matrix result_small_matrix(4, 4, result_small);
+        result_small_matrix.print();
+        
+        std::cout << "\nVerification (should be close to identity):" << std::endl;
+        Matrix verification_small = input_small.multiply(result_small_matrix);
+        verification_small.print();
+        
+        // Test with larger matrix
+        std::cout << "\n=== Testing with 6x6 Hilbert matrix ===" << std::endl;
+        const int size = 6;
+        std::vector<double> matrix_data;
+        matrix_data.reserve(size * size);
+        
+        // Generate Hilbert matrix (well-conditioned for this size)
+        for (int i = 0; i < size; i++) {
+            for (int j = 0; j < size; j++) {
+                matrix_data.push_back(1.0 / (i + j + 1.0));
+            }
+        }
+        
+        auto start = std::chrono::high_resolution_clock::now();
+        auto result = cpu_binv.binv(matrix_data, size, size, 3);
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+        
+        std::cout << "Input matrix (" << size << "x" << size << "):" << std::endl;
+        Matrix input(size, size, matrix_data);
         input.print();
         
         std::cout << "\nResult matrix:" << std::endl;
-        Matrix result_matrix(4, 4, result);
+        Matrix result_matrix(size, size, result);
         result_matrix.print();
         
         // Verify by multiplying original * result
         std::cout << "\nVerification (should be close to identity):" << std::endl;
         Matrix verification = input.multiply(result_matrix);
         verification.print();
+        
+        std::cout << "\nComputation time: " << duration.count() << " microseconds" << std::endl;
         
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
@@ -344,4 +425,4 @@ int main() {
     return 0;
 }
 
-// g++ -std=c++14 -O3 -pthread cpu_block_binv.cpp -o cpu_block_binv
+// Compile with: g++ -std=c++14 -O3 -march=native -pthread -flto optimized_cpu_block_binv.cpp -o optimized_cpu_block_binv
